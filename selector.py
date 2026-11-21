@@ -14,6 +14,7 @@ WORKER_COST = 2.0
 FAMILY = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")
 ATTR = re.compile(r"^\s*([A-Z][A-Z0-9_]+)\s*(?::[^=]+)?=[^=]")
 HEDGE_SECONDS = 0.5
+ATTR_NAME = re.compile(r"[A-Z][A-Z0-9_]+$")
 DOC_SUFFIXES = (".md", ".rst", ".txt")
 
 
@@ -118,7 +119,8 @@ def main():
             return best
 
         def stmt_mask(self, st, line=None):
-            start, end, kind = st
+            start, end, kind = st[0], st[1], st[2]
+            name = st[3] if len(st) > 3 else ""
             m = 0
             if kind == 1:  # def/class header: anything that runs inside it
                 if start in self.line_mask:
@@ -131,8 +133,17 @@ def main():
                 if sc and not sc[2]:
                     m |= self.range_mask(sc[0], sc[1])
                 else:
-                    m |= self.whole()
-                    m |= self.family_mask
+                    rm = 0
+                    if name and ATTR_NAME.match(name):
+                        for rp, a, b in cov["refs"].get(name, ()):
+                            g = get(rp)
+                            if g is not None:
+                                rm |= g.range_mask(a, b)
+                        if self.family_mask:
+                            rm &= self.family_mask
+                        m |= rm | self.range_mask(sc[0], sc[1]) if sc else rm
+                    else:
+                        m |= self.whole() | self.family_mask
             return m
 
     fcache = {}
@@ -237,9 +248,16 @@ def main():
         if path.startswith("sqlglot/") and path.endswith(".py"):
             return sqlglot_py(path, edits)
         if path.startswith("tests/fixtures/"):
+            if path in cov.get("fixtures", {}):
+                got = {num_by_id[i] for i in cov["fixtures"][path] if i in num_by_id}
+                if path.startswith("tests/fixtures/optimizer/") and path.endswith(".sql"):
+                    got |= fixture_tests(path)
+                return got
             return fixture_tests(path)
         if path.startswith("tests/") and path.endswith(".py"):
-            return file_tests.get(path) or no_heavy
+            if Path(path).name.startswith("test_"):
+                return file_tests.get(path) or no_heavy
+            return all_tests
         return all_tests
 
     def split(chosen):

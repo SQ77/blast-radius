@@ -50,7 +50,10 @@ for p in list(res):
                 elif hasattr(ch,"body") and isinstance(getattr(ch,"body"),list):
                     st.append([ch.lineno,ch.body[0].lineno-1,2])
                 else:
-                    st.append([ch.lineno,ch.end_lineno,0])
+                    nm=""
+                    tg=getattr(ch,"targets",None) or ([ch.target] if hasattr(ch,"target") else [])
+                    if tg and isinstance(tg[0],ast.Name): nm=tg[0].id
+                    st.append([ch.lineno,ch.end_lineno,0,nm])
             visit(ch)
     visit(t)
     res[p]["st"]=st; res[p]["sc"]=sc
