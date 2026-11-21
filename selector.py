@@ -182,6 +182,12 @@ def main():
             return set()
         f.family_mask = f.family_mask_all(path)
         mask = 0
+        for kind, ln, text in edits:
+            if skippable(text):
+                continue
+            for sc_ in f.sc:
+                if len(sc_) > 4 and sc_[4] and sc_[0] <= ln <= sc_[1]:
+                    mask |= f.range_mask(sc_[0], sc_[1])  # cached results: later tests never reach the line
         pool_tests = path == "sqlglot/serde.py" or (
             path == "sqlglot/expressions/core.py"
             and any(525 <= ln <= 545 or 885 <= ln <= 905 for _, ln, _ in edits)

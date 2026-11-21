@@ -36,6 +36,7 @@ for p,d in per.items():
 for p in imp:
     if p not in res: res[p]={"l":[],"s":[],"i":sorted(imp[p])}
 import ast, os
+import re as _re0
 SRC=sys.argv[4]
 for p in list(res):
     t=ast.parse(open(os.path.join(SRC,p),encoding="utf-8").read())
@@ -46,7 +47,13 @@ for p in list(res):
             if isinstance(ch,ast.stmt):
                 if isinstance(ch,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)):
                     a=min([ch.lineno]+[d.lineno for d in ch.decorator_list])
-                    st.append([a,ch.body[0].lineno-1,1]); sc.append([a,ch.end_lineno,int(isinstance(ch,ast.ClassDef)),ch.name])
+                    st.append([a,ch.body[0].lineno-1,1]); cached=0
+                    if not isinstance(ch,ast.ClassDef):
+                        for x_ in ast.walk(ch):
+                            nm_=x_.id if isinstance(x_,ast.Name) else (x_.attr if isinstance(x_,ast.Attribute) else "")
+                            if nm_ and _re0.search(r"cache|memo",nm_,_re0.I) and not nm_.lower().endswith("uncache"):
+                                cached=1;break
+                    sc.append([a,ch.end_lineno,int(isinstance(ch,ast.ClassDef)),ch.name,cached])
                 elif hasattr(ch,"body") and isinstance(getattr(ch,"body"),list):
                     st.append([ch.lineno,ch.body[0].lineno-1,2])
                 else:
