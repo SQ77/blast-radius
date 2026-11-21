@@ -91,9 +91,6 @@ def main():
                 m |= sets[self.s[k]]
             return m
 
-        def start_imp(self, ln):
-            return True
-
         def family_mask_all(self, path):
             m = 0
             if path.startswith(FAMILY):
@@ -200,7 +197,7 @@ def main():
                 if st0 is None or any(x in f.imp for x in range(st0[0], st0[1] + 1)):
                     risky.add(path)
                 nm = ATTR.match(text)
-                if nm and (f.start_imp(ln) or True):
+                if nm:
                     rm = 0
                     for rp, a, b in cov["refs"].get(nm.group(1), ()):
                         g = get(rp)
