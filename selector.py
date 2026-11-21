@@ -19,7 +19,13 @@ FAMILY = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlgl
 ATTR = re.compile(r"^\s*([A-Z][A-Z0-9_]+)\s*(?::[^=]+)?=[^=]")
 HEDGE_SECONDS = 0.5
 ATTR_NAME = re.compile(r"[A-Z][A-Z0-9_]+$")
+PROBE = {"comment", "fixture"}  # diagnostic: run every test for these kinds of patch
 DOC_SUFFIXES = (".md", ".rst", ".txt")
+
+
+def skippable_line(text):
+    s = text.strip()
+    return not s or s.startswith("#")
 
 
 def parse_patch(text):
@@ -328,6 +334,19 @@ def main():
                         chosen |= file_tests.get(f"tests/dialects/test_{Path(p).stem}.py", set())
                 else:
                     chosen = set(all_tests)
+        kinds = set()
+        parsed = parse_patch(text)
+        if any(p.startswith("tests/fixtures/") for p in parsed):
+            kinds.add("fixture")
+        if parsed and all(
+            p.endswith(DOC_SUFFIXES) or (p.endswith(".py") and all(skippable_line(t_) for _, _, t_ in e))
+            for p, e in parsed.items()
+        ):
+            kinds.add("comment")
+        if risky:
+            kinds.add("risky")
+        if kinds & PROBE:
+            chosen = set(all_tests)
         if len(chosen) >= 0.6 * len(all_tests):
             chosen = set(all_tests)  # a collection-time crash fails whole files
         print(json.dumps({"commit": patch.stem, "workers": split(chosen)}))
