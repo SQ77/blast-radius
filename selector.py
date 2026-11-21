@@ -176,14 +176,14 @@ def main():
 
     risky = set()
 
-    def sqlglot_py(path, edits):
+    def sqlglot_py(path, edits, force=False):
         f = get(path)
         if f is None:
             return set()
         f.family_mask = f.family_mask_all(path)
         mask = 0
         for kind, ln, text in edits:
-            if skippable(text):
+            if skippable(text) and not force:
                 continue
             for sc_ in f.sc:
                 if len(sc_) > 4 and sc_[4] and sc_[0] <= ln <= sc_[1]:
@@ -193,7 +193,7 @@ def main():
             and any(525 <= ln <= 545 or 885 <= ln <= 905 for _, ln, _ in edits)
         )
         for kind, ln, text in edits:
-            if skippable(text):
+            if skippable(text) and not force:
                 continue
             if kind == "r":
                 st0 = f.owner(ln)
@@ -276,7 +276,15 @@ def main():
         if path.endswith(DOC_SUFFIXES):
             return set()
         if path.endswith(".py") and all(skippable(t) for _, _, t in edits):
-            return hedge(path, edits)
+            real = False
+            if path.startswith("sqlglot/"):
+                try:
+                    real = importcheck.comment_edit_is_real(path, edits)
+                except Exception:
+                    real = True
+            if not real:
+                return hedge(path, edits)
+            return sqlglot_py(path, edits, force=True)
         if path.startswith("sqlglot/") and path.endswith(".py"):
             return sqlglot_py(path, edits)
         if path.startswith("tests/fixtures/"):

@@ -107,3 +107,39 @@ def imports_ok(patch_text, paths):
     except Exception:
         return None
     return r.returncode == 0
+
+
+def comment_edit_is_real(path, edits):
+    """True if an edit that looks like a comment/blank line could change behaviour:
+    it sits inside a (non-docstring) multi-line string, after a backslash continuation,
+    or we cannot read the source to check."""
+    import ast
+    try:
+        src = open(f"{SRC}/{path}", encoding="utf-8").read()
+        tree = ast.parse(src)
+    except Exception:
+        return True
+    lines = src.split("\n")
+    doc_ids = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            b = node.body
+            if b and isinstance(b[0], ast.Expr) and isinstance(getattr(b[0], "value", None), ast.Constant) \
+                    and isinstance(b[0].value.value, str):
+                doc_ids.add(id(b[0].value))
+    spans = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Constant, ast.JoinedStr)) and id(node) not in doc_ids:
+            if isinstance(node, ast.Constant) and not isinstance(node.value, (str, bytes)):
+                continue
+            if node.end_lineno > node.lineno:
+                spans.append((node.lineno, node.end_lineno))
+    for kind, ln, _ in edits:
+        for a, b in spans:
+            # removed line ln, or insertion before old line ln
+            if (kind == "r" and a <= ln <= b) or (kind == "a" and a < ln <= b):
+                return True
+        prev = lines[ln - 2] if 2 <= ln <= len(lines) + 1 else ""
+        if prev.rstrip().endswith("\\"):
+            return True
+    return False
