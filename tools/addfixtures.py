@@ -14,6 +14,10 @@ for p, node, phase in r:
             # fixture loaders are cached, so later readers go unseen: take the whole file
             f = node.split("::")[0]
             sel = {i for i in ids if i.startswith(f + "::")}
+    elif phase == "setup":
+        # class/module-level setup is shared by every test in the file
+        f = node.split("::")[0]
+        sel = {i for i in ids if i.startswith(f + "::")}
     else:
         sel = {i for i in ids if i.startswith(node)}
     fx.setdefault("tests/" + p, set()).update(sel)
