@@ -52,6 +52,51 @@ def parse_patch(text):
     return out
 
 
+OPERAND = r"(?:None|[A-Z][A-Za-z]+\.[A-Z][A-Z0-9_]+)"
+CMP = re.compile(r"\s*(?:is not|is|==|!=)\s*(?=" + OPERAND + ")")
+
+
+def _norm_cmp(line):
+    """Map `is`/`==` and `is not`/`!=` to one token when compared with None or an enum member."""
+    return CMP.sub(lambda m: " ~= " if m.group(0).strip() in ("is not", "!=") else " == ", line)
+
+
+def equivalent_swaps(text):
+    """path -> set of old line numbers whose only change is is<->== / is not<->!= against
+    None or an enum member (a rewrite that cannot change behaviour)."""
+    out, cur, old = {}, None, 0
+    rem, add, start = [], [], 0
+
+    def flush():
+        nonlocal rem, add
+        if rem and len(rem) == len(add) and cur:
+            for k, ((ln, a), b) in enumerate(zip(rem, add)):
+                if a != b and _norm_cmp(a) == _norm_cmp(b):
+                    out.setdefault(cur, set()).add(ln)
+        rem, add = [], []
+
+    hunk = False
+    for line in text.splitlines():
+        if line.startswith("diff --git "):
+            flush()
+            m = re.match(r"diff --git a/(\S+) b/(\S+)", line)
+            cur, hunk = (m.group(1) if m else None), False
+        elif line.startswith("@@") and cur:
+            flush()
+            old, hunk = int(re.match(r"@@ -(\d+)", line).group(1)), True
+        elif cur and hunk and line[:1] == "-":
+            rem.append((old, line[1:]))
+            old += 1
+        elif cur and hunk and line[:1] == "+":
+            add.append(line[1:])
+        else:
+            flush()
+            if cur and hunk and line[:1] == " ":
+                old += 1
+    flush()
+    return out
+
+
 def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     by_number = {t["number"]: t for t in tests}
@@ -269,7 +314,12 @@ def main():
             spent += by_number[n]["seconds"]
         return picked
 
+    swaps = {}
+
     def select(path, edits):
+        sw = swaps.get(path, set())
+        if sw and path.startswith("sqlglot/"):
+            edits = [e for e in edits if not (e[0] == "r" and e[1] in sw)] or [("r", min(sw), "#")]
         if path.endswith(DOC_SUFFIXES):
             return set()
         if path.endswith(".py") and all(skippable(t) for _, _, t in edits):
@@ -316,6 +366,8 @@ def main():
         text = patch.read_text(encoding="utf-8", errors="replace")
         chosen = set()
         risky.clear()
+        swaps.clear()
+        swaps.update(equivalent_swaps(text))
         for path, edits in parse_patch(text).items():
             chosen |= select(path, edits)
         if risky and len(chosen) < len(all_tests):
