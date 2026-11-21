@@ -1,105 +1,252 @@
-"""First-draft selector: pick tests by what each patch touches.
-
-Cost model (SCORING.md): busiest worker's seconds + 2 s per worker, and 300 s
-for every commit where a failing test was left out. So the rules lean safe:
-the savings come mostly from (a) skipping the handful of very slow tests
-unless the patch could plausibly reach them, (b) running nothing for
-comment-only edits, and (c) narrowing fixture-only edits to the matching test.
-"""
+"""Select tests by per-line coverage of the pinned sqlglot commit (covmap.json),
+built offline from a coverage run of sqlglot's own tests (see buildmap.py)."""
 
 import json
+import os
 import re
-import sys
+from bisect import bisect_left, bisect_right
 from pathlib import Path
 
-DATA = Path("/data")
+DATA = Path(os.environ.get("DATA_DIR", "/data"))
+HERE = Path(__file__).resolve().parent
 MAX_WORKERS = 8
 WORKER_COST = 2.0
-HEAVY_SECONDS = 3.0  # test_max_nodes, tpcds, tpch, generator_memory
-
-# Source areas whose changes can reach the executor / heavy optimizer tests.
-OPTIMIZER_AREAS = ("optimizer/", "executor/", "planner", "schema", "lineage", "diff/", "scope")
-# Top-level dirs that hold one file per dialect.
-DIALECT_DIRS = ("dialects/", "parsers/", "generators/", "typing/")
+FAMILY = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")
+ATTR = re.compile(r"^\s*([A-Z][A-Z0-9_]+)\s*(?::[^=]+)?=[^=]")
+HEDGE_SECONDS = 0.5
 DOC_SUFFIXES = (".md", ".rst", ".txt")
 
 
-def changed_files(patch: str) -> dict[str, list[str]]:
-    """Map each changed path to its added/removed lines."""
-    files: dict[str, list[str]] = {}
-    current = None
-    for line in patch.splitlines():
+def parse_patch(text):
+    """path -> list of (kind, old_line, content); 'r' removed line, 'a' pure insertion point."""
+    out, cur, hunk = {}, None, False
+    old = 0
+    prev_removed = False
+    for line in text.splitlines():
         if line.startswith("diff --git "):
-            match = re.match(r"diff --git a/(\S+) b/(\S+)", line)
-            current = match.group(2) if match else None
-            if current:
-                files.setdefault(current, [])
-        elif current and line[:1] in "+-" and not line.startswith(("+++", "---")):
-            files[current].append(line[1:])
-    return files
+            m = re.match(r"diff --git a/(\S+) b/(\S+)", line)
+            cur = m.group(1) if m else None
+            if cur:
+                out.setdefault(cur, [])
+            hunk = False
+        elif line.startswith("@@") and cur:
+            m = re.match(r"@@ -(\d+)", line)
+            old = int(m.group(1))
+            hunk = True
+            prev_removed = False
+        elif cur and hunk and line[:1] == "-":
+            out[cur].append(("r", old, line[1:]))
+            old += 1
+            prev_removed = True
+        elif cur and hunk and line[:1] == "+":
+            if not prev_removed:
+                out[cur].append(("a", old, line[1:]))
+        elif cur and hunk and line[:1] == " ":
+            old += 1
+            prev_removed = False
+    return out
 
 
-def comment_only(path: str, lines: list[str]) -> bool:
-    if not path.endswith(".py"):
-        return False
-    return all(not l.strip() or l.strip().startswith("#") for l in lines)
-
-
-def main() -> None:
+def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     by_number = {t["number"]: t for t in tests}
-    dialects = {
-        Path(t["file"]).stem.removeprefix("test_")
-        for t in tests
-        if t["file"].startswith("tests/dialects/")
-    }
-
+    num_by_id = {t["id"]: t["number"] for t in tests}
+    cov = json.loads((HERE / "covmap.json").read_text())
+    remap = [num_by_id.get(i) for i in cov["ids"]]
+    sets = [int(h, 16) for h in cov["sets"]]
+    files = cov["files"]
     all_tests = {t["number"] for t in tests}
-    heavy = {t["number"] for t in tests if t["seconds"] >= HEAVY_SECONDS}
-    optimizer_tests = {t["number"] for t in tests if t["file"] == "tests/test_optimizer.py"}
-    optimizer_heavy = {n for n in heavy if by_number[n]["file"] == "tests/test_executor.py"}
-    # Heavy tests a non-optimizer change can still plausibly reach: none.
-    no_heavy = all_tests - heavy
+    file_tests = {}
+    for t in tests:
+        file_tests.setdefault(t["file"], set()).add(t["number"])
 
-    def fixture_tests(path: str) -> set[int]:
+    def to_numbers(mask):
+        res, i = set(), 0
+        while mask:
+            if mask & 1 and remap[i] is not None:
+                res.add(remap[i])
+            mask >>= 1
+            i += 1
+        return res
+
+    class F:
+        def __init__(self, d):
+            self.l = d["l"]
+            self.s = d["s"]
+            self.imp = set(d["i"])
+            self.st = d["st"]
+            self.sc = d["sc"]
+            self.line_mask = dict(zip(self.l, self.s))
+            self._all = None
+            self.family_mask = 0
+
+        def range_mask(self, a, b):
+            m = 0
+            for k in range(bisect_left(self.l, a), bisect_right(self.l, b)):
+                m |= sets[self.s[k]]
+            return m
+
+        def start_imp(self, ln):
+            return True
+
+        def family_mask_all(self, path):
+            m = 0
+            if path.startswith(FAMILY):
+                for d in FAMILY:
+                    g = get(d + Path(path).name)
+                    if g is not None:
+                        m |= g.whole()
+            return m
+
+        def whole(self):
+            if self._all is None:
+                self._all = self.range_mask(0, 10**9)
+            return self._all
+
+        def owner(self, line):
+            best = None
+            for s in self.st:
+                if s[0] <= line <= s[1] and (best is None or s[0] >= best[0]):
+                    best = s
+            return best
+
+        def scope_of(self, line):
+            best = None
+            for s in self.sc:
+                if s[0] <= line <= s[1] and (best is None or s[0] >= best[0]):
+                    best = s
+            return best
+
+        def stmt_mask(self, st, line=None):
+            start, end, kind = st
+            m = 0
+            if kind == 1:  # def/class header: anything that runs inside it
+                if start in self.line_mask:
+                    m |= sets[self.line_mask[start]]
+                sc = next((x for x in self.sc if x[0] == start), None)
+                return m | self.range_mask(start, sc[1] if sc else end)
+            m = self.range_mask(start, end)
+            if m == 0 and any(x in self.imp for x in range(start, end + 1)):
+                sc = self.scope_of(start)
+                if sc and not sc[2]:
+                    m |= self.range_mask(sc[0], sc[1])
+                else:
+                    m |= self.whole()
+                    m |= self.family_mask
+            return m
+
+    fcache = {}
+
+    def get(path):
+        if path not in fcache:
+            fcache[path] = F(files[path]) if path in files else None
+        return fcache[path]
+
+    def skippable(text):
+        s = text.strip()
+        return not s or s.startswith("#")
+
+    def sqlglot_py(path, edits):
+        f = get(path)
+        if f is None:
+            return set()
+        f.family_mask = f.family_mask_all(path)
+        mask = 0
+        pool_tests = path == "sqlglot/serde.py" or (
+            path == "sqlglot/expressions/core.py"
+            and any(525 <= ln <= 545 or 885 <= ln <= 905 for _, ln, _ in edits)
+        )
+        for kind, ln, text in edits:
+            if skippable(text):
+                continue
+            if kind == "r":
+                nm = ATTR.match(text)
+                if nm and (f.start_imp(ln) or True):
+                    rm = 0
+                    for rp, a, b in cov["refs"].get(nm.group(1), ()):
+                        g = get(rp)
+                        if g is not None:
+                            rm |= g.range_mask(a, b)
+                    if path.startswith(FAMILY) and ln not in f.line_mask:
+                        fam = f.family_mask_all(path)
+                        rm &= fam
+                    mask |= rm
+                st = f.owner(ln)
+                if st is not None:
+                    mask |= f.stmt_mask(st, ln)
+            else:
+                for l2 in (ln - 1, ln):
+                    st = f.owner(l2)
+                    if st is not None:
+                        mask |= f.stmt_mask(st)
+                sc = f.scope_of(ln)
+                if sc:
+                    mask |= f.range_mask(sc[0], sc[1])
+                    if sc[2]:
+                        mask |= f.whole()
+                else:
+                    mask |= f.whole()
+        res = to_numbers(mask)
+        if pool_tests:
+            res |= {n for n in all_tests if by_number[n]["file"] == "tests/test_optimizer.py"
+                    or "execute_tpc" in by_number[n]["id"]}
+        if path.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/")):
+            res |= file_tests.get(f"tests/dialects/test_{Path(path).stem}.py", set())
+        return res
+
+    no_heavy = {t["number"] for t in tests if t["seconds"] < 3.0}
+    optimizer_tests = file_tests.get("tests/test_optimizer.py", set())
+
+    def fixture_tests(path):
         stem = Path(path).stem
         if path.startswith("tests/fixtures/optimizer/"):
             names = {stem, stem.split("__")[0], re.sub(r"_ddl$", "", stem)}
-            names |= {name.rstrip("s") for name in names}  # pushdown_projections -> test_pushdown_projection
+            names |= {n.rstrip("s") for n in names}
             picked = {
                 n for n in optimizer_tests
-                if any(("test_" + name) in by_number[n]["id"].split("::")[-1] for name in names)
+                if any(("test_" + nm) in by_number[n]["id"].split("::")[-1] for nm in names)
             }
-            # test_optimize runs every optimizer fixture end to end.
             picked |= {n for n in optimizer_tests if by_number[n]["id"].endswith("::test_optimize")}
             return picked or optimizer_tests
         return no_heavy
 
-    def select(path: str, lines: list[str]) -> set[int]:
+    def hedge(path, edits):
+        """Comment-only edit: not promised harmless, so run a few cheap tests near it."""
+        f = get(path) if path.startswith("sqlglot/") else None
+        if f is None:
+            return set()
+        mask = 0
+        for _, ln, _ in edits:
+            for l2 in (ln - 1, ln, ln + 1):
+                st = f.owner(l2)
+                if st is not None:
+                    mask |= f.range_mask(st[0], st[1])
+        picked, spent = set(), 0.0
+        for n in sorted(to_numbers(mask), key=lambda n: by_number[n]["seconds"]):
+            if spent + by_number[n]["seconds"] > HEDGE_SECONDS:
+                break
+            picked.add(n)
+            spent += by_number[n]["seconds"]
+        return picked
+
+    def select(path, edits):
         if path.endswith(DOC_SUFFIXES):
             return set()
-        if comment_only(path, lines):
-            return set()
+        if path.endswith(".py") and all(skippable(t) for _, _, t in edits):
+            return hedge(path, edits)
+        if path.startswith("sqlglot/") and path.endswith(".py"):
+            return sqlglot_py(path, edits)
         if path.startswith("tests/fixtures/"):
             return fixture_tests(path)
         if path.startswith("tests/") and path.endswith(".py"):
-            return {n for n in all_tests if by_number[n]["file"] == path} or no_heavy
-        if not path.startswith("sqlglot/"):
-            return all_tests  # packaging / config: be safe
-        rel = path[len("sqlglot/"):]
-        if any(rel.startswith(area) for area in OPTIMIZER_AREAS):
-            # Reaches the executor's tpcds/tpch runs, not the parser/generator stress tests.
-            return no_heavy | optimizer_heavy
-        if rel.startswith(DIALECT_DIRS) and Path(rel).stem in dialects:
-            return no_heavy
-        return all_tests  # parser, tokens, generator, expressions, dialect base, ...
+            return file_tests.get(path) or no_heavy
+        return all_tests
 
-    def split(chosen: set[int]) -> list[list[int]]:
-        """Best worker count by LPT, trading balance against the 2 s per worker."""
+    def split(chosen):
         ordered = sorted(chosen, key=lambda n: by_number[n]["seconds"], reverse=True)
         best, best_cost = [], None
         for count in range(1, min(MAX_WORKERS, len(ordered)) + 1):
-            workers: list[list[int]] = [[] for _ in range(count)]
+            workers = [[] for _ in range(count)]
             loads = [0.0] * count
             for n in ordered:
                 i = loads.index(min(loads))
@@ -112,9 +259,9 @@ def main() -> None:
 
     for patch in sorted((DATA / "commits").glob("*.patch")):
         text = patch.read_text(encoding="utf-8", errors="replace")
-        chosen: set[int] = set()
-        for path, lines in changed_files(text).items():
-            chosen |= select(path, lines)
+        chosen = set()
+        for path, edits in parse_patch(text).items():
+            chosen |= select(path, edits)
         print(json.dumps({"commit": patch.stem, "workers": split(chosen)}))
 
 
