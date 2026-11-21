@@ -336,6 +336,8 @@ def main():
                         chosen |= file_tests.get(f"tests/dialects/test_{Path(p).stem}.py", set())
                 else:
                     chosen = set(all_tests)
+        if any(p.startswith("tests/fixtures/") for p in parse_patch(text)):
+            chosen = set(all_tests)  # diagnostic probe B: fixtures only
         if len(chosen) >= 0.6 * len(all_tests):
             chosen = set(all_tests)  # a collection-time crash fails whole files
         print(json.dumps({"commit": patch.stem, "workers": split(chosen)}))
