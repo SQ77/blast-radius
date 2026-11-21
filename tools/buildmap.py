@@ -46,7 +46,7 @@ for p in list(res):
             if isinstance(ch,ast.stmt):
                 if isinstance(ch,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)):
                     a=min([ch.lineno]+[d.lineno for d in ch.decorator_list])
-                    st.append([a,ch.body[0].lineno-1,1]); sc.append([a,ch.end_lineno,int(isinstance(ch,ast.ClassDef))])
+                    st.append([a,ch.body[0].lineno-1,1]); sc.append([a,ch.end_lineno,int(isinstance(ch,ast.ClassDef)),ch.name])
                 elif hasattr(ch,"body") and isinstance(getattr(ch,"body"),list):
                     st.append([ch.lineno,ch.body[0].lineno-1,2])
                 else:
@@ -58,6 +58,10 @@ for p in list(res):
     visit(t)
     res[p]["st"]=st; res[p]["sc"]=sc
 import re as _re
+CLASSES=set()
+for p in res:
+    for n_ in ast.walk(ast.parse(open(os.path.join(SRC,p),encoding="utf-8").read())):
+        if isinstance(n_,ast.ClassDef): CLASSES.add(n_.name)
 refs={}
 for p in res:
     t=ast.parse(open(os.path.join(SRC,p),encoding="utf-8").read())
@@ -74,10 +78,29 @@ for p in res:
             nm=None
             if isinstance(ch,ast.Attribute): nm=ch.attr
             elif isinstance(ch,ast.Name): nm=ch.id
-            if nm and _re.fullmatch(r"[A-Z][A-Z0-9_]+",nm) and o:
+            if nm and (_re.fullmatch(r"[A-Z][A-Z0-9_]+",nm) or nm in CLASSES) and o:
                 refs.setdefault(nm,set()).add((p,)+tuple(o))
             walk(ch,o)
     walk(t,None)
 refs={k:sorted(v) for k,v in refs.items()}
-json.dump({"refs":refs,"ids":[t["id"] for t in tests],"sets":list(sets),"files":res}, open(out,"w"), separators=(",",":"))
+FAM=("dialects","parsers","generators","typing")
+imp_graph={}
+for p in res:
+    parts=p.split("/")
+    if len(parts)==3 and parts[1] in FAM:
+        me=parts[2][:-3]
+        for n_ in ast.walk(ast.parse(open(os.path.join(SRC,p),encoding="utf-8").read())):
+            if isinstance(n_,ast.ImportFrom) and n_.module:
+                mp=n_.module.split(".")
+                if len(mp)==3 and mp[0]=="sqlglot" and mp[1] in FAM and mp[2] not in ("dialect",) and mp[2]!=me:
+                    imp_graph.setdefault(mp[2],set()).add(me)
+deps={}
+for x in imp_graph:
+    seen=set(); todo=[x]
+    while todo:
+        c_=todo.pop()
+        for d_ in imp_graph.get(c_,()):
+            if d_ not in seen: seen.add(d_); todo.append(d_)
+    deps[x]=sorted(seen)
+json.dump({"deps":deps,"refs":refs,"ids":[t["id"] for t in tests],"sets":list(sets),"files":res}, open(out,"w"), separators=(",",":"))
 print(len(sets), len(res), file=sys.stderr)

@@ -4,8 +4,12 @@ built offline from a coverage run of sqlglot's own tests (see buildmap.py)."""
 import json
 import os
 import re
+import sys
 from bisect import bisect_left, bisect_right
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import importcheck
 
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
 HERE = Path(__file__).resolve().parent
@@ -93,10 +97,12 @@ def main():
         def family_mask_all(self, path):
             m = 0
             if path.startswith(FAMILY):
-                for d in FAMILY:
-                    g = get(d + Path(path).name)
-                    if g is not None:
-                        m |= g.whole()
+                stem = Path(path).stem
+                for st_ in [stem] + cov.get("deps", {}).get(stem, []):
+                    for d in FAMILY:
+                        g = get(d + st_ + ".py")
+                        if g is not None:
+                            m |= g.whole()
             return m
 
         def whole(self):
@@ -128,11 +134,22 @@ def main():
                 sc = next((x for x in self.sc if x[0] == start), None)
                 return m | self.range_mask(start, sc[1] if sc else end)
             m = self.range_mask(start, end)
-            if m == 0 and any(x in self.imp for x in range(start, end + 1)):
+            # a changed line that only runs at import (e.g. a table entry) acts through data flow
+            line_import_only = line is not None and line in self.imp and line not in self.line_mask
+            if (m == 0 and any(x in self.imp for x in range(start, end + 1))) or line_import_only:
                 sc = self.scope_of(start)
                 if sc and not sc[2]:
                     m |= self.range_mask(sc[0], sc[1])
                 else:
+                    if sc and sc[2] and len(sc) > 3:
+                        cm = 0
+                        for rp, a, b in cov["refs"].get(sc[3], ()):
+                            g = get(rp)
+                            if g is not None:
+                                cm |= g.range_mask(a, b)
+                        if self.family_mask:
+                            cm &= self.family_mask
+                        m |= cm
                     rm = 0
                     if name and ATTR_NAME.match(name):
                         for rp, a, b in cov["refs"].get(name, ()):
@@ -157,6 +174,8 @@ def main():
         s = text.strip()
         return not s or s.startswith("#")
 
+    risky = set()
+
     def sqlglot_py(path, edits):
         f = get(path)
         if f is None:
@@ -171,6 +190,9 @@ def main():
             if skippable(text):
                 continue
             if kind == "r":
+                st0 = f.owner(ln)
+                if st0 is None or any(x in f.imp for x in range(st0[0], st0[1] + 1)):
+                    risky.add(path)
                 nm = ATTR.match(text)
                 if nm and (f.start_imp(ln) or True):
                     rm = 0
@@ -186,6 +208,9 @@ def main():
                 if st is not None:
                     mask |= f.stmt_mask(st, ln)
             else:
+                sc0 = f.scope_of(ln)
+                if sc0 is None or sc0[2]:
+                    risky.add(path)
                 for l2 in (ln - 1, ln):
                     st = f.owner(l2)
                     if st is not None:
@@ -202,7 +227,8 @@ def main():
             res |= {n for n in all_tests if by_number[n]["file"] == "tests/test_optimizer.py"
                     or "execute_tpc" in by_number[n]["id"]}
         if path.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/")):
-            res |= file_tests.get(f"tests/dialects/test_{Path(path).stem}.py", set())
+            for st_ in [Path(path).stem] + cov.get("deps", {}).get(Path(path).stem, []):
+                res |= file_tests.get(f"tests/dialects/test_{st_}.py", set())
         return res
 
     no_heavy = {t["number"] for t in tests if t["seconds"] < 3.0}
@@ -278,8 +304,26 @@ def main():
     for patch in sorted((DATA / "commits").glob("*.patch")):
         text = patch.read_text(encoding="utf-8", errors="replace")
         chosen = set()
+        risky.clear()
         for path, edits in parse_patch(text).items():
             chosen |= select(path, edits)
+        if risky and len(chosen) < len(all_tests):
+            try:
+                verdict = importcheck.imports_ok(text, sorted(risky))
+            except Exception:
+                verdict = None
+            if verdict is False:
+                if all(p.startswith(FAMILY) for p in risky):
+                    for p in risky:
+                        for d in FAMILY:
+                            g = get(d + Path(p).name)
+                            if g is not None:
+                                chosen |= to_numbers(g.whole())
+                        chosen |= file_tests.get(f"tests/dialects/test_{Path(p).stem}.py", set())
+                else:
+                    chosen = set(all_tests)
+        if len(chosen) >= 0.6 * len(all_tests):
+            chosen = set(all_tests)  # a collection-time crash fails whole files
         print(json.dumps({"commit": patch.stem, "workers": split(chosen)}))
 
 
